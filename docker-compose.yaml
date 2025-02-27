@@ -1,0 +1,14 @@
+
+services:
+  scraper:
+    build:
+      context: .
+      args:
+        - SCRAPE_URL=${SCRAPE_URL}
+    image: scraper-app
+    container_name: scraper-container
+    ports:
+      - "5000:5000"
+    environment:
+      - SCRAPE_URL=${SCRAPE_URL}
+    restart: always
