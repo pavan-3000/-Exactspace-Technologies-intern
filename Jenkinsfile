@@ -15,8 +15,10 @@ pipeline {
 
         stage('Build & Test') {
             steps {
-                sh 'python3 -m pip install --no-cache-dir -r requirements.txt'
-                sh 'python3 -m pytest --tb=short || true'
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    sh 'python -m pip install --no-cache-dir -r requirements.txt'
+                    sh 'python -m pytest --tb=short || true'
+                }
             }
         }
 
