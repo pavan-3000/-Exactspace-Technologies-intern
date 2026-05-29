@@ -22,14 +22,14 @@ pipeline {
 
                         if ! which docker 2>/dev/null && [ ! -x "$TOOLS_DIR/bin/docker" ]; then
                             DOCKER_VERSION=24.0.7
-                            curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" -o /tmp/docker-cli.tgz
-                            tar -xz -C /tmp -f /tmp/docker-cli.tgz
-                            mv /tmp/docker/docker "$TOOLS_DIR/bin/docker"
-                            rm -rf /tmp/docker-cli.tgz /tmp/docker
+                            curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" -o /tmp/docker-cli.tgz 2>/dev/null || true
+                            tar -xz -C /tmp -f /tmp/docker-cli.tgz 2>/dev/null || true
+                            mv /tmp/docker/docker "$TOOLS_DIR/bin/docker" 2>/dev/null || true
+                            rm -rf /tmp/docker-cli.tgz /tmp/docker 2>/dev/null || true
                         fi
 
                         if ! which trivy 2>/dev/null && [ ! -x "$TOOLS_DIR/bin/trivy" ]; then
-                            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$TOOLS_DIR/bin"
+                            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$TOOLS_DIR/bin" 2>/dev/null || true
                         fi
                     '''
                 }
@@ -38,17 +38,13 @@ pipeline {
 
         stage('Install Dependencies') {
             steps {
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                    sh 'pip install -r requirements.txt'
-                }
+                sh 'pip install -r requirements.txt'
             }
         }
 
         stage('Run Tests') {
             steps {
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                    sh 'pytest'
-                }
+                sh 'pytest' // Assumes pytest is being used for testing
             }
         }
 
@@ -72,22 +68,20 @@ pipeline {
         stage('Docker Build') {
             when { expression { return fileExists('Dockerfile') } }
             steps {
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                    script {
-                        withEnv(["PATH+DEVPILOT=${env.HOME}/devpilot-tools/bin"]) {
-                            def dockerAvailable = sh(script: 'which docker 2>/dev/null', returnStatus: true) == 0
-                            if (dockerAvailable) {
-                                def daemonOk = sh(script: 'docker info > /dev/null 2>&1', returnStatus: true) == 0
-                                if (daemonOk) {
-                                    sh "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
-                                    sh "docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest"
-                                } else {
-                                    echo 'Docker CLI found but daemon not reachable — mount the socket: docker run -v /var/run/docker.sock:/var/run/docker.sock'
-                                }
-                            } else {
-                                echo 'Docker not available — Setup Tools stage may have failed to download it'
+                script {
+                    def dockerAvailable = sh(script: 'which docker 2>/dev/null || test -x /usr/bin/docker', returnStatus: true) == 0
+                    if (dockerAvailable) {
+                        def daemonOk = sh(script: 'docker info > /dev/null 2>&1', returnStatus: true) == 0
+                        if (daemonOk) {
+                            retry(2) {
+                                sh "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
                             }
+                            sh "docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest"
+                        } else {
+                            echo 'Docker daemon not reachable — run: docker exec jenkins chmod 666 /var/run/docker.sock'
                         }
+                    } else {
+                        echo 'Docker not available — install Docker in the Jenkins image or mount the socket'
                     }
                 }
             }
@@ -117,32 +111,31 @@ pipeline {
         always {
             script {
                 def status = currentBuild.result ?: 'IN_PROGRESS'
-                def prompt = "Analyze this Jenkins CI/CD pipeline and give 2-3 actionable bullet points: what passed, what failed (if any), and one improvement recommendation.\n\nJob: ${env.JOB_NAME}\nBuild #${env.BUILD_NUMBER}\nBranch: ${env.GIT_BRANCH ?: env.BRANCH_NAME ?: 'unknown'}\nStatus: ${status}"
+                def promptText = "Analyze this Jenkins CI/CD build and give 2-3 actionable bullet points: what passed, what failed (if any), and one improvement.\nJob: ${env.JOB_NAME} Build#${env.BUILD_NUMBER} Branch: ${env.GIT_BRANCH ?: env.BRANCH_NAME ?: 'unknown'} Status: ${status}"
                 def aiDone = false
 
-                // Try Claude — DevPilot-synced key first, then user's own Jenkins credential
                 for (def credId : ['devpilot-anthropic-key', 'ANTHROPIC_API_KEY']) {
                     if (aiDone) break
                     try {
                         withCredentials([string(credentialsId: credId, variable: 'ANTHROPIC_KEY')]) {
-                            def payload = groovy.json.JsonOutput.toJson([
+                            writeFile file: '.ai-payload.json', text: groovy.json.JsonOutput.toJson([
                                 model: 'claude-haiku-4-5-20251001',
                                 max_tokens: 350,
-                                messages: [[role: 'user', content: prompt]]
+                                messages: [[role: 'user', content: promptText]]
                             ])
-                            def conn = new URL('https://api.anthropic.com/v1/messages').openConnection()
-                            conn.requestMethod = 'POST'
-                            conn.doOutput = true
-                            conn.setRequestProperty('Content-Type', 'application/json')
-                            conn.setRequestProperty('x-api-key', env.ANTHROPIC_KEY)
-                            conn.setRequestProperty('anthropic-version', '2023-06-01')
-                            conn.outputStream << payload.getBytes('UTF-8')
-                            def code = conn.responseCode
-                            def resp = code < 400 ? conn.inputStream.text : conn.errorStream.text
-                            if (code == 200) {
-                                def parsed = new groovy.json.JsonSlurper().parseText(resp)
-                                echo "\n=== Claude AI Build Analysis ===\n${parsed.content[0].text}\n================================"
-                                writeFile file: 'ai-analysis.json', text: resp
+                            def rc = sh returnStatus: true, script: '''
+                                curl -sf -X POST https://api.anthropic.com/v1/messages \
+                                  -H 'Content-Type: application/json' \
+                                  -H "x-api-key: $ANTHROPIC_KEY" \
+                                  -H 'anthropic-version: 2023-06-01' \
+                                  --max-time 30 \
+                                  -d @.ai-payload.json \
+                                  -o .ai-response.json
+                            '''
+                            if (rc == 0) {
+                                def resp = new groovy.json.JsonSlurper().parseText(readFile('.ai-response.json'))
+                                echo "\n=== Claude AI Build Analysis ===\n${resp.content[0].text}\n================================"
+                                writeFile file: 'ai-analysis.json', text: readFile('.ai-response.json')
                                 archiveArtifacts artifacts: 'ai-analysis.json', allowEmptyArchive: true
                                 aiDone = true
                             }
@@ -150,28 +143,27 @@ pipeline {
                     } catch (ignored) {}
                 }
 
-                // Try ChatGPT — DevPilot-synced key first, then user's own Jenkins credential
                 for (def credId : ['devpilot-openai-key', 'OPENAI_API_KEY']) {
                     if (aiDone) break
                     try {
                         withCredentials([string(credentialsId: credId, variable: 'OPENAI_KEY')]) {
-                            def payload = groovy.json.JsonOutput.toJson([
+                            writeFile file: '.ai-payload.json', text: groovy.json.JsonOutput.toJson([
                                 model: 'gpt-4o-mini',
                                 max_tokens: 350,
-                                messages: [[role: 'user', content: prompt]]
+                                messages: [[role: 'user', content: promptText]]
                             ])
-                            def conn = new URL('https://api.openai.com/v1/chat/completions').openConnection()
-                            conn.requestMethod = 'POST'
-                            conn.doOutput = true
-                            conn.setRequestProperty('Content-Type', 'application/json')
-                            conn.setRequestProperty('Authorization', "Bearer ${env.OPENAI_KEY}")
-                            conn.outputStream << payload.getBytes('UTF-8')
-                            def code = conn.responseCode
-                            def resp = code < 400 ? conn.inputStream.text : conn.errorStream.text
-                            if (code == 200) {
-                                def parsed = new groovy.json.JsonSlurper().parseText(resp)
-                                echo "\n=== ChatGPT Build Analysis ===\n${parsed.choices[0].message.content}\n==============================="
-                                writeFile file: 'ai-analysis.json', text: resp
+                            def rc = sh returnStatus: true, script: '''
+                                curl -sf -X POST https://api.openai.com/v1/chat/completions \
+                                  -H 'Content-Type: application/json' \
+                                  -H "Authorization: Bearer $OPENAI_KEY" \
+                                  --max-time 30 \
+                                  -d @.ai-payload.json \
+                                  -o .ai-response.json
+                            '''
+                            if (rc == 0) {
+                                def resp = new groovy.json.JsonSlurper().parseText(readFile('.ai-response.json'))
+                                echo "\n=== ChatGPT Build Analysis ===\n${resp.choices[0].message.content}\n==============================="
+                                writeFile file: 'ai-analysis.json', text: readFile('.ai-response.json')
                                 archiveArtifacts artifacts: 'ai-analysis.json', allowEmptyArchive: true
                                 aiDone = true
                             }
