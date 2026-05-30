@@ -1,5 +1,4 @@
 FROM python:3.11-slim AS base
-cvdfvd
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
